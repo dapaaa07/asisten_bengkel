@@ -856,7 +856,6 @@ class _TransactionPageState extends State<TransactionPage> {
     if (userText.isEmpty && imagesToSend.isEmpty) return;
 
     setState(() {
-      // Jika user tidak ngetik, kasih tahu di UI kalau dia kirim gambar
       _messages.insert(0, {
         "text": userText.isEmpty ? "(Mengirim Gambar)" : userText,
         "isUser": true,
@@ -869,12 +868,11 @@ class _TransactionPageState extends State<TransactionPage> {
 
     try {
       final allData = await DatabaseHelper.instance.cariBarang("");
-      // Format daftar diperjelas agar AI mudah mencocokkan harga
       String dbContext = allData
           .map((e) => "- ${e['nama']} (Harga: Rp${e['harga']})")
           .join("\n");
 
-      // PROMPT SUPER KETAT ANTI-NGARANG
+      // PROMPT KASIR MULTI-ITEM (BISA BACA BANYAK BARANG SEKALIGUS)
       String prompt =
           '''
 Kamu adalah mesin sistem kasir. Tugasmu HANYA membaca data dan merespon dengan JSON.
@@ -883,16 +881,18 @@ DAFTAR HARGA STOK RESMI:
 $dbContext
 
 ATURAN MUTLAK (JIKA DILANGGAR TRANSAKSI GAGAL):
-1. Lihat barang apa yang ada di foto atau yang diminta pada pesan user.
-2. CARI nama barang tersebut di "DAFTAR HARGA STOK RESMI" di atas.
-3. HARGA WAJIB DIAMBIL DARI DAFTAR DI ATAS. Dilarang keras menggunakan harga dari luar daftar!
-4. Jika beli lebih dari satu (misal "2 busi"), kalikan harganya.
-5. Jika barang yang difoto TIDAK ADA di "DAFTAR HARGA STOK RESMI", dilarang membuat JSON. Jawab dengan teks: "Barang tidak ditemukan di database stok".
-6. Jika ada teks biaya jasa (misal: "jasa 20rb"), ekstrak angkanya ke "biaya_jasa". Jika tidak disebutkan, isi 0.
-7. Jawab HANYA menggunakan format JSON murni.
+1. Identifikasi SEMUA barang yang ada di foto (bisa lebih dari 1 jenis barang) atau yang diminta pada pesan user.
+2. CARI nama SETIAP barang tersebut di "DAFTAR HARGA STOK RESMI" di atas. HARGA WAJIB DIAMBIL DARI DAFTAR DI ATAS.
+3. Hitung sub-total untuk masing-masing barang (Harga x Jumlah).
+4. Jumlahkan semua sub-total barang menjadi "total_barang".
+5. Pada bagian "deskripsi", tulis rincian keranjang belanjanya. Contoh: "Oli MPX (1x Rp50.000), Busi NGK (2x Rp25.000)".
+6. Jika ada barang di foto yang TIDAK ADA di "DAFTAR HARGA STOK RESMI", abaikan dari perhitungan total, tapi beri tahu di akhir deskripsi. Contoh: "... (Catatan: Kampas rem tidak terdaftar)".
+7. Jika SEMUA barang di foto tidak ada di daftar stok, DILARANG membuat JSON. Jawab dengan teks: "Barang tidak ditemukan di database stok bos".
+8. Jika ada teks biaya jasa (misal: "jasa 20rb"), ekstrak angkanya ke "biaya_jasa". Jika tidak disebutkan, isi 0.
+9. Jawab HANYA menggunakan format JSON murni.
 
-CONTOH JSON:
-{"action": "transaksi", "deskripsi": "Oli MPX", "biaya_jasa": 20000, "total_barang": 50000}
+CONTOH JSON JIKA ADA 2 BARANG & JASA:
+{"action": "transaksi", "deskripsi": "Oli MPX (1x Rp50.000), Busi NGK (2x Rp25.000)", "biaya_jasa": 20000, "total_barang": 100000}
 
 PESAN DARI USER:
 "${userText.isEmpty ? '[User hanya melampirkan foto tanpa teks]' : userText}"
@@ -925,9 +925,8 @@ PESAN DARI USER:
             {"role": "user", "content": contentArray},
           ],
           "max_tokens": 512,
-          "temperature":
-              0.0, // NOL MUTLAK: Mematikan total kemampuan AI untuk menebak/berimajinasi
-          "top_p": 0.1, // Fokus tinggi pada kecocokan teks
+          "temperature": 0.0, // Harus 0.0 agar hitungan matematikanya akurat
+          "top_p": 0.1,
           "stream": false,
         }),
       );
@@ -959,8 +958,9 @@ PESAN DARI USER:
 
             setState(() {
               _messages.insert(0, {
+                // Tampilan nota di-update agar lebih rapi
                 "text":
-                    "✅ Transaksi Berhasil Dicatat!\nBarang: ${data['deskripsi']}\nTotal Barang: Rp$tBarang\nBiaya Jasa: Rp$bJasa\nGrand Total: Rp$grandTotal",
+                    "✅ Transaksi Multi-Item Dicatat!\n\n🛒 Rincian:\n${data['deskripsi']}\n\n📦 Total Barang: Rp$tBarang\n🔧 Biaya Jasa: Rp$bJasa\n💰 Grand Total: Rp$grandTotal",
                 "isUser": false,
                 "images": <File>[],
               });
@@ -968,14 +968,14 @@ PESAN DARI USER:
           } catch (e) {
             setState(
               () => _messages.insert(0, {
-                "text": "Gagal menyimpan transaksi bos. Format data salah.",
+                "text":
+                    "Gagal menyimpan transaksi bos. AI salah format perhitungan.",
                 "isUser": false,
                 "images": <File>[],
               }),
             );
           }
         } else {
-          // Jika AI membalas teks (misal: "Barang tidak ditemukan")
           setState(
             () => _messages.insert(0, {
               "text": aiResponse,
@@ -987,7 +987,7 @@ PESAN DARI USER:
       } else {
         setState(
           () => _messages.insert(0, {
-            "text": "Error Server",
+            "text": "Error Server (${response.statusCode})",
             "isUser": false,
             "images": <File>[],
           }),
@@ -1204,46 +1204,98 @@ class _ReportPageState extends State<ReportPage> {
   }
 
   // FUNGSI EXPORT EXCEL
+  // FUNGSI EXPORT EXCEL (SUDAH DIPERBAIKI ANTI BUG)
   Future<void> _exportToExcel() async {
-    var excel = Excel.createExcel();
-    Sheet sheet = excel['Laporan Penjualan'];
-    excel.delete('Sheet1');
-
-    // Header
-    sheet.appendRow([
-      TextCellValue("No"),
-      TextCellValue("Tanggal"),
-      TextCellValue("Deskripsi"),
-      TextCellValue("Biaya Barang"),
-      TextCellValue("Biaya Jasa"),
-      TextCellValue("Grand Total"),
-    ]);
-
-    for (var i = 0; i < _reports.length; i++) {
-      var r = _reports[i];
-      sheet.appendRow([
-        IntCellValue(i + 1),
-        TextCellValue(
-          DateFormat('dd/MM/yyyy HH:mm').format(DateTime.parse(r['tanggal'])),
-        ),
-        TextCellValue(r['deskripsi']),
-        IntCellValue(r['total_barang']),
-        IntCellValue(r['biaya_jasa']),
-        IntCellValue(r['grand_total']),
-      ]);
+    if (_reports.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Tidak ada data untuk diekspor bos!")),
+      );
+      return;
     }
 
-    var fileBytes = excel.save();
-    var directory = await getTemporaryDirectory();
-    String filePath =
-        "${directory.path}/Laporan_Penjualan_${DateTime.now().millisecondsSinceEpoch}.xlsx";
-    File(filePath)
-      ..createSync(recursive: true)
-      ..writeAsBytesSync(fileBytes!);
+    try {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Sedang merakit laporan keuangan..."),
+          duration: Duration(seconds: 1),
+        ),
+      );
 
-    await Share.shareXFiles([
-      XFile(filePath),
-    ], text: 'Laporan Penjualan NF Garage');
+      var excel = Excel.createExcel();
+      var sheet = excel['Sheet1'];
+
+      // 1. Header
+      sheet.appendRow([
+        TextCellValue("No"),
+        TextCellValue("Tanggal"),
+        TextCellValue("Deskripsi"),
+        TextCellValue("Biaya Barang (Rp)"),
+        TextCellValue("Biaya Jasa (Rp)"),
+        TextCellValue("Grand Total (Rp)"),
+      ]);
+
+      int totalPendapatan = 0;
+
+      // 2. Isi Data & Hitung Total
+      for (var i = 0; i < _reports.length; i++) {
+        var r = _reports[i];
+        int subTotal = int.parse(r['grand_total'].toString());
+        totalPendapatan += subTotal; // Akumulasi total pendapatan
+
+        sheet.appendRow([
+          IntCellValue(i + 1),
+          TextCellValue(
+            DateFormat(
+              'dd/MM/yyyy HH:mm',
+            ).format(DateTime.parse(r['tanggal'].toString())),
+          ),
+          TextCellValue(r['deskripsi'].toString()),
+          IntCellValue(int.parse(r['total_barang'].toString())),
+          IntCellValue(int.parse(r['biaya_jasa'].toString())),
+          IntCellValue(subTotal),
+        ]);
+      }
+
+      // 3. Tambahkan Baris Kosong Sebagai Pembatas
+      sheet.appendRow([TextCellValue("")]);
+
+      // 4. Tambahkan Baris TOTAL PENDAPATAN
+      sheet.appendRow([
+        TextCellValue(""),
+        TextCellValue(""),
+        TextCellValue("TOTAL PENDAPATAN KESELURUHAN"),
+        TextCellValue(""),
+        TextCellValue(""),
+        IntCellValue(totalPendapatan), // Nilai total di kolom paling kanan
+      ]);
+
+      // Simpan dan Bagikan
+      var fileBytes = excel.save();
+      if (fileBytes == null) throw "Gagal merakit byte Excel";
+
+      final directory = await getApplicationDocumentsDirectory();
+      String fileName =
+          "Laporan_Keuangan_NF_${DateFormat('yyyyMMdd').format(DateTime.now())}.xlsx";
+      String filePath = "${directory.path}/$fileName";
+
+      final file = File(filePath);
+      await file.writeAsBytes(fileBytes);
+
+      if (await file.exists()) {
+        await Share.shareXFiles([
+          XFile(filePath),
+        ], text: 'Laporan Penjualan NF Garage - Total: Rp$totalPendapatan');
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Gagal export: $e"),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
   }
 
   void _showEditDialog(Map<String, dynamic> item) {
