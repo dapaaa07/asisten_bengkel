@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.asisten_bengkel"
+    namespace = "com.dapa.NFgarageAdmin"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
